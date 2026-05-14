@@ -5,8 +5,9 @@ import numpy as np
 import datetime
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- [1. 시스템 설정 및 자동 백업] ---
+# --- [1. 시스템 설정] ---
 BACKUP_KRX_FILE = "backup_krx.json"
 
 @st.cache_data(ttl=3600)
@@ -21,8 +22,9 @@ def get_full_krx_list():
             return pd.read_json(BACKUP_KRX_FILE)
         return pd.DataFrame([{"Code": "005930", "Name": "삼성전자"}])
 
-# --- [2. v5.9.80 스캔 전용 엔진] ---
-def scan_engine_v80(ticker, name):
+# --- [2. v5.9.80 병렬 스캔 엔진] ---
+def scan_engine_v80(row):
+    ticker, name = row['Code'], row['Name']
     ticker_str = str(ticker).zfill(6)
     target_date = datetime.date.today()
     start_date = target_date - datetime.timedelta(days=200)
@@ -73,12 +75,12 @@ def scan_engine_v80(ticker, name):
     return None
 
 # --- [3. UI 레이아웃] ---
-st.set_page_config(page_title="Phoenix v5.9.80 Full-Scan", layout="wide")
+st.set_page_config(page_title="Phoenix v5.9.80 Parallel", layout="wide")
 st.markdown("<style>div.stApp {background: white !important;} * {color: black !important;}</style>", unsafe_allow_html=True)
 
-st.title("🛰️ Phoenix v5.9.80 [Full-Scan Edition]")
+st.title("⚡ Phoenix v5.9.80 [Turbo Parallel]")
 
-if st.button("🚀 KRX 전 종목 정밀 스캔 시작 (약 2,500개)", width='stretch'):
+if st.button("🚀 KRX 전 종목 초고속 병렬 스캔 시작", width='stretch'):
     krx_list = get_full_krx_list()
     results = []
     
@@ -89,22 +91,29 @@ if st.button("🚀 KRX 전 종목 정밀 스캔 시작 (약 2,500개)", width='s
     start_time = time.time()
     total_count = len(krx_list)
     
-    for i, (idx, row) in enumerate(krx_list.iterrows()):
-        res = scan_engine_v80(row['Code'], row['Name'])
-        if res:
-            results.append(res)
+    # [병렬 처리 실행 구역]
+    # max_workers는 서버 사양에 따라 조절 (무료 티어는 10~15 추천)
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        # 작업을 스케줄링
+        futures = {executor.submit(scan_engine_v80, row): row for _, row in krx_list.iterrows()}
         
-        # [실시간 상태 브리핑 로직]
-        if i % 10 == 0 or i == total_count - 1:
-            elapsed_time = time.time() - start_time
-            avg_time_per_stock = elapsed_time / (i + 1)
-            remaining_stocks = total_count - (i + 1)
-            estimated_remaining_time = avg_time_per_stock * remaining_stocks
+        completed_count = 0
+        for future in as_completed(futures):
+            completed_count += 1
+            res = future.result()
+            if res:
+                results.append(res)
             
-            prog_bar.progress((i + 1) / total_count)
-            status_text.markdown(f"**📡 스캔 중:** `[{row['Code']}] {row['Name']}` (`{i+1}`/`{total_count}`)")
-            time_text.markdown(f"**⏱️ 예상 남은 시간:** `{int(estimated_remaining_time // 60)}분 {int(estimated_remaining_time % 60)}초` | **경과 시간:** `{int(elapsed_time // 60)}분 {int(elapsed_time % 60)}초` ")
-            
+            # 실시간 상태 브리핑 (50개 단위로 UI 업데이트하여 성능 저하 방지)
+            if completed_count % 50 == 0 or completed_count == total_count:
+                elapsed_time = time.time() - start_time
+                avg_time = elapsed_time / completed_count
+                rem_time = avg_time * (total_count - completed_count)
+                
+                prog_bar.progress(completed_count / total_count)
+                status_text.markdown(f"**⚡ 병렬 스캔 중:** `{completed_count}` / `{total_count}` 완료")
+                time_text.markdown(f"**⏱️ 예상 남은 시간:** `{int(rem_time // 60)}분 {int(rem_time % 60)}초` | **경과 시간:** `{int(elapsed_time // 60)}분 {int(elapsed_time % 60)}초` ")
+
     prog_bar.empty()
     status_text.empty()
     time_text.empty()
@@ -115,6 +124,6 @@ if st.button("🚀 KRX 전 종목 정밀 스캔 시작 (약 2,500개)", width='s
         st.subheader(f"🎯 포착된 정예 종목 ({len(results)}개)")
         scan_df = pd.DataFrame(results)
         st.dataframe(scan_df.sort_values(by='적합도', ascending=False), use_container_width=True, hide_index=True)
-        st.success(f"✅ 스캔 완료! (총 소요 시간: {int((time.time() - start_time)//60)}분 {int((time.time() - start_time)%60)}초)")
+        st.success(f"✅ 초고속 스캔 완료! (총 소요 시간: {int((time.time() - start_time)//60)}분 {int((time.time() - start_time)%60)}초)")
     else:
         st.warning("⚠️ 현재 조건(적합도 90점 이상)을 충족하는 종목이 없습니다.")
