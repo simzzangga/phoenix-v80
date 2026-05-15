@@ -14,22 +14,24 @@ SCAN_RESULT_FILE = "last_scan_results.json"
 ANALYSIS_LOG_FILE, BACKUP_KRX_FILE = "analysis_log_v5.json", "backup_krx.json"
 BG_IMG_URL = "https://raw.githubusercontent.com/simzzangga/phoenix-v80/main/300km.png"
 
-st.set_page_config(page_title="Phoenix v5.9.88", layout="centered")
+st.set_page_config(page_title="Phoenix v5.9.89", layout="centered")
 
-# 하야부사 300km/h 배경화면 및 커스텀 스타일
+# [수정] 배경화면 위치 하단 고정 및 차트 가시성 강화 스타일
 st.markdown(f"""
     <style>
     .stApp {{
         background-image: url("{BG_IMG_URL}");
         background-size: cover;
-        background-position: center;
+        background-position: center bottom; /* 하야부사 위치 고정 */
         background-attachment: fixed;
     }}
     .stApp > header {{ background: transparent; }}
     section[data-testid="stSidebar"] {{ background: rgba(0,0,0,0.85) !important; }}
     .stMarkdown, .stText, p, h1, h2, h3, span {{ color: white !important; font-family: 'Courier New', monospace; }}
-    .stButton>button {{ background-color: #D32F2F !important; color: white !important; border: none; font-weight: bold; }}
-    .stDataFrame {{ background: rgba(0,0,0,0.7); }}
+    .stButton>button {{ background-color: #D32F2F !important; color: white !important; border: none; font-weight: bold; width: 100%; }}
+    .stDataFrame {{ background: rgba(0,0,0,0.8); border: 1px solid #444; }}
+    /* 드롭다운 배경 수정 */
+    div[data-baseweb="select"] > div {{ background-color: rgba(0,0,0,0.7) !important; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -56,8 +58,7 @@ def get_krx_list():
         return df
     except: return pd.DataFrame([{"Code": "005930", "Name": "삼성전자"}])
 
-# --- [2. v5.9.88 하이퍼 오버로드 엔진] ---
-def analyze_overload_v88(ticker, target_date):
+def analyze_overload_v89(ticker, target_date):
     ticker_str = str(ticker).zfill(6)
     try:
         df = fdr.DataReader(ticker_str, target_date - datetime.timedelta(days=120), target_date)
@@ -69,7 +70,6 @@ def analyze_overload_v88(ticker, target_date):
         pre_20 = df['CLOSE'].iloc[-21:-1]
         cv_val = (pre_20.std() / pre_20.mean()) * 100
         vol_ratio = df['VOLUME'].iloc[-1] / (df['VOLUME'].iloc[-21:-1].mean() + 1)
-        body_ratio = (df['CLOSE'].iloc[-1] - df['OPEN'].iloc[-1]) / (df['HIGH'].iloc[-1] - df['LOW'].iloc[-1] + 0.001)
         
         cv_score = max(0, 100 - (abs(cv_val - 1.9) * 20))
         vol_score = min(100, (vol_ratio / 5.0) * 100)
@@ -79,7 +79,6 @@ def analyze_overload_v88(ticker, target_date):
         if 84.5 <= similarity <= 90.0: fit_score += 30
         if 2.8 <= vol_ratio <= 4.2: fit_score += 30
         if 1.5 <= cv_val <= 2.2: fit_score += 25
-        if 0.65 <= abs(body_ratio) <= 0.85: fit_score += 15
         if vol_cliff: fit_score += 20
         
         is_noise = (target_date.weekday() == 2) or (target_date.month in [2, 3])
@@ -101,7 +100,7 @@ krx_df = get_krx_list()
 krx_df['Display'] = krx_df['Code'] + " | " + krx_df['Name']
 
 col_h1, col_h2 = st.columns([9, 1])
-with col_h1: st.markdown("### 🟢 PHOENIX v5.9.88")
+with col_h1: st.markdown("### 🟢 PHOENIX v5.9.89")
 with col_h2:
     if st.button("🔄"):
         st.cache_data.clear()
@@ -115,37 +114,49 @@ for idx, log in enumerate(analysis_log[:15]):
         st.session_state.auto_code = log['code']; st.rerun()
 
 with st.form("ignite_form"):
-    # [Link Logic] 세션 상태에 auto_code가 있으면 해당 인덱스를 디폴트로 잡음
     def_idx = 0
     if st.session_state.auto_code:
         matches = [i for i, x in enumerate(krx_df['Code']) if x == st.session_state.auto_code]
         if matches: def_idx = matches[0]
-    
     search_input = st.selectbox("🎯 타겟 선택", krx_df['Display'].tolist(), index=def_idx)
-    btn_click = st.form_submit_button("　　　　　🚀 IGNITION　　　　　", type="primary", use_container_width=True)
+    btn_click = st.form_submit_button("　　　　　🚀 IGNITION　　　　　", type="primary")
 
 if btn_click or st.session_state.auto_code:
     t_code = search_input.split(" | ")[0] if not st.session_state.auto_code else st.session_state.auto_code
-    res, df = analyze_overload_v88(t_code, datetime.date.today())
+    res, df = analyze_overload_v89(t_code, datetime.date.today())
     if res:
         name = krx_df[krx_df['Code'] == t_code]['Name'].values[0]
         temp_log = [l for l in load_data(ANALYSIS_LOG_FILE, []) if str(l['code']).zfill(6) != t_code]
         temp_log.insert(0, {"name": name, "code": t_code}); save_data(ANALYSIS_LOG_FILE, temp_log[:40])
         st.markdown(f"#### {res['상태']} : {name}")
         st.write(f"**적합도:** {res['적합도']} | **비중:** {res['금일비중']} | **익절:** {res['익절']} | **손절:** {res['손절']}")
-        fig = go.Figure(data=[go.Candlestick(open=df['OPEN'], high=df['HIGH'], low=df['LOW'], close=df['CLOSE'])])
-        fig.update_layout(height=280, margin=dict(l=0,r=0,t=0,b=0), template="plotly_dark", xaxis_rangeslider_visible=False, xaxis_showticklabels=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        
+        # [수정] 차트 가시성 강화: 흰색 테두리 및 텍스트 라벨
+        fig = go.Figure(data=[go.Candlestick(
+            open=df['OPEN'], high=df['HIGH'], low=df['LOW'], close=df['CLOSE'],
+            increasing_line_color='red', decreasing_line_color='blue',
+            increasing_line_width=1.5, decreasing_line_width=1.5,
+            line=dict(width=1, color='white') # 봉 테두리 흰색 추가
+        )])
+        
+        last_c = df['CLOSE'].iloc[-1]
+        fig.add_hline(y=last_c*1.1, line_dash="dot", line_color="orange", annotation_text="[TARGET]", annotation_position="top right")
+        fig.add_hline(y=last_c*0.97, line_dash="solid", line_color="red", annotation_text="[STOP]", annotation_position="bottom right")
+        
+        fig.update_layout(height=220, margin=dict(l=0,r=0,t=0,b=0), template="plotly_dark", 
+                          xaxis_rangeslider_visible=False, xaxis_showticklabels=False,
+                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-        st.session_state.auto_code = "" # 분석 완료 후 초기화
+        st.session_state.auto_code = ""
 
 st.divider()
 
-if st.button("🏁 오늘의 코스 레코드 시작 (전 종목 스캔)", use_container_width=True):
+if st.button("🏁 오늘의 코스 레코드 시작", use_container_width=True):
     results = []
     prog, st_text, tm_text = st.progress(0), st.empty(), st.empty()
     start_tm, total = time.time(), len(krx_df)
     with ThreadPoolExecutor(max_workers=30) as ex:
-        futures = {ex.submit(analyze_overload_v88, row['Code'], datetime.date.today()): row for _, row in krx_df.iterrows()}
+        futures = {ex.submit(analyze_overload_v89, row['Code'], datetime.date.today()): row for _, row in krx_df.iterrows()}
         for i, future in enumerate(as_completed(futures)):
             r, _ = future.result()
             if r and r['is_valid']:
@@ -159,9 +170,7 @@ if st.button("🏁 오늘의 코스 레코드 시작 (전 종목 스캔)", use_c
 if st.session_state.scan_storage:
     s_df = pd.DataFrame(st.session_state.scan_storage).sort_values(by='적합도', ascending=False)
     st.dataframe(s_df[['날짜', '종목명', '종목코드', '적합도', '상태', '금일비중', '익절', '손절']], use_container_width=True, hide_index=True)
-    
-    # [RECOVERY] 리스트 결과에서 선택 시 상단 분석기로 전송하는 기능
-    selected_target = st.selectbox("🎯 코스 레코드에서 타겟 선택 (상단 이동)", ["선택하세요"] + (s_df['종목코드'] + " | " + s_df['종목명']).tolist())
+    selected_target = st.selectbox("🎯 타겟 락온 (상단 이동)", ["선택하세요"] + (s_df['종목코드'] + " | " + s_df['종목명']).tolist())
     if selected_target != "선택하세요":
         st.session_state.auto_code = selected_target.split(" | ")[0]
         st.rerun()
