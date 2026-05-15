@@ -1,18 +1,7 @@
-# --- Phoenix v5.9.88 Core Dependencies ---
-
-# 메인 프레임워크 (배경화면 CSS 최적화 버전)
 streamlit>=1.25.0
-
-# 금융 데이터 수신 엔진
 finance-datareader>=0.9.50
 yfinance>=0.2.28
-
-# 데이터 처리 및 수치 연산
 pandas>=1.5.0
 numpy>=1.24.0
-
-# 하야부사 HUD 및 차트 렌더링
 plotly>=5.10.0
-
-# 병렬 처리 및 시스템 유틸리티 (Python 기본 라이브러리 외 필요 시)
 requests>=2.31.0
