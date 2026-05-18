@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 import time
 import random
 import requests
-from io import StringIO  # [🚨 야후 데이터 정형화 스트림 모듈]
+from io import StringIO  # 야후 CSV 스트림 정형화 모듈
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- [1. 최상단 시스템 설정 및 세션/네트워크 무결성 고정] ---
@@ -35,6 +35,7 @@ def save_to_fixed_log(name, code):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_krx_list_ultimate():
+    """상장 종목 리스트 수집 공정 및 차단 발생 시 로컬 백업 강제 인지 이식 패치"""
     if os.path.exists(BACKUP_KRX_FILE):
         try:
             df_l = pd.read_json(BACKUP_KRX_FILE)
@@ -50,22 +51,26 @@ def get_krx_list_ultimate():
         st.session_state.server_status = "🔥 글로벌 구조선 가동"
         return df
     except:
+        # [🚨 긴급 조치 반영]: 외부 KRX 리스트 서버 마비 시, 기존 로컬 백업본을 무조건 강제 인식시켜 2,500개 전 종목 개방
+        if os.path.exists(BACKUP_KRX_FILE):
+            st.session_state.server_status = "🔥 글로벌 구조선 연결 성공 (LOCAL ANCHOR)"
+            return pd.read_json(BACKUP_KRX_FILE)
         st.session_state.server_status = "⚠️ 서버 점검 중"
         return pd.DataFrame([{"Code": "005930", "Name": "삼성전자"}, {"Code": "000660", "Name": "SK하이닉스"}])
 
-# --- [2. 100% 순혈 KRX 정밀 분석 엔진 (v5.14.3 야후 긴급 대체 구조형)] ---
+# --- [2. 100% 순혈 KRX 정밀 분석 엔진 (야후 수정주가 팩터 완전 교정형)] ---
 def analyze_v14(ticker, target_date, is_parallel=False):
     ticker_str = str(ticker).zfill(6)
     priority_score = 0 
     try:
         if is_parallel: time.sleep(random.uniform(0.01, 0.04))
             
-        # ─── [🚨 막혀버린 네이버 라인을 완전히 파괴하는 글로벌 파이프라인 이식] ───
+        # 차단당한 네이버 라인을 완전히 탈출하는 글로벌 야후 파이낸스 파이프라인
         df = None
         for suffix in ['.KS', '.KQ']:  # 코스피/코스닥 순차 격파
             yahoo_ticker = f"{ticker_str}{suffix}"
             end_ts = int(time.mktime(target_date.timetuple())) + 86400
-            start_ts = end_ts - (180 * 86400) # 넉넉하게 180일치 데이터 풀 확보
+            start_ts = end_ts - (180 * 86400) # 변동성 및 이격도 계산을 위한 180일 주가 풀 확보
             
             url = f"https://query1.finance.yahoo.com/v7/finance/download/{yahoo_ticker}?period1={start_ts}&period2={end_ts}&interval=1d&events=history&includeAdjustedClose=true"
             headers = {'User-Agent': 'Mozilla/5.0'}
@@ -74,8 +79,9 @@ def analyze_v14(ticker, target_date, is_parallel=False):
             if response.status_code == 200 and "Date,Open,High" in response.text:
                 df_raw = pd.read_csv(StringIO(response.text))
                 
-                # 야후의 영문 데이터 스키마를 v5.14.0 규격인 대문자 OPEN, HIGH, LOW, CLOSE, VOLUME으로 정교하게 정형화
-                # 특히 수정종가(Adj Close) 비율을 역대입하여 수정주가 캔들 꼬리 왜곡을 원천 차단
+                # [🚨 컬럼 및 수정주가 왜곡 예방 패치]
+                # 야후 영문 구조를 대문자 영문 규격으로 완벽 가공 및 리네이밍
+                # 특히 야후의 수정종가(Adj Close) 비율을 역대입하여 수정주가 캔들 꼬리 왜곡을 원천 차단
                 df_raw['Adj_Ratio'] = df_raw['Adj Close'] / df_raw['Close']
                 df_raw['OPEN'] = df_raw['Open'] * df_raw['Adj_Ratio']
                 df_raw['HIGH'] = df_raw['High'] * df_raw['Adj_Ratio']
@@ -166,7 +172,7 @@ def analyze_v14(ticker, target_date, is_parallel=False):
         }, df
     except: return None, None
 
-# --- [3. UI 레이아웃] ---
+# --- [3. UI 레이아웃 및 폼 렌더링 파트] ---
 st.set_page_config(page_title="Phoenix Pulse v5.14.3", layout="wide")
 krx_df = get_krx_list_ultimate()
 krx_df['Display'] = krx_df['Code'] + " | " + krx_df['Name']
@@ -201,6 +207,7 @@ if btn_click or (st.session_state.auto_code != ""):
     t_code = selected_disp.split(" | ")[0] if not st.session_state.auto_code else st.session_state.auto_code
     d_name = krx_df[krx_df['Code'] == t_code]['Name'].values[0]
     
+    # 결과 수신 실패 유무와 상관없이 무조건 로그 선제적 무결 보장
     save_to_fixed_log(d_name, t_code)
     
     res, df_chart = analyze_v14(t_code, d_input, is_parallel=False)
@@ -248,6 +255,7 @@ if btn_click or (st.session_state.auto_code != ""):
 
 st.divider()
 
+# --- [4. 전 종목 스나이퍼 광역 병렬 스캔 파트] ---
 if st.button("🚀 전 종목 광역 정밀 병렬 스캔 (스나이퍼 모드)", use_container_width=True):
     temp_results = []
     p_bar = st.progress(0)
@@ -284,3 +292,12 @@ if st.session_state.scan_storage and len(st.session_state.scan_storage) > 0:
     cols = ['종목명', '종목코드', '적합도', '상태', '분할매수', '비중', '거래대금(억)', '목표타격가', '최종손절선', '거래량비']
     existing_cols = [c for c in cols if c in scan_df.columns]
     st.dataframe(scan_df[existing_cols], use_container_width=True, hide_index=True)
+    
+    target_list = (scan_df['종목코드'] + " | " + scan_df['종목명']).tolist() if '종목코드' in scan_df.columns else []
+    if target_list:
+        lock_on = st.selectbox("🎯 타겟 락온 (상단 작전판 이동)", ["선택하세요"] + target_list, key="sniper_lock_on_widget")
+        if lock_on != "선택하세요":
+            next_code = lock_on.split(" | ")[0]
+            if st.session_state.auto_code != next_code:
+                st.session_state.auto_code = next_code
+                st.rerun()
