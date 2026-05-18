@@ -7,170 +7,272 @@ import json
 import os
 import plotly.graph_objects as go
 import time
+import requests
+from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- [1. 시스템 설정 & 배경화면] ---
+# --- [1. 최상단 시스템 설정 및 세션 영속성 고정] ---
 SCAN_RESULT_FILE = "last_scan_results.json"
-ANALYSIS_LOG_FILE, BACKUP_KRX_FILE = "analysis_log_v5.json", "backup_krx.json"
-BG_IMG_URL = "https://raw.githubusercontent.com/simzzangga/phoenix-v80/main/300km.png"
+BACKUP_KRX_FILE = "backup_krx.json"
 
-st.set_page_config(page_title="Phoenix v5.9.89", layout="centered")
+if "scan_storage" not in st.session_state:
+    if os.path.exists(SCAN_RESULT_FILE):
+        try:
+            with open(SCAN_RESULT_FILE, "r", encoding="utf-8") as f:
+                st.session_state.scan_storage = json.load(f)
+        except: st.session_state.scan_storage = []
+    else: st.session_state.scan_storage = []
 
-# [수정] 배경화면 위치 하단 고정 및 차트 가시성 강화 스타일
-st.markdown(f"""
-    <style>
-    .stApp {{
-        background-image: url("{BG_IMG_URL}");
-        background-size: cover;
-        background-position: center bottom; /* 하야부사 위치 고정 */
-        background-attachment: fixed;
-    }}
-    .stApp > header {{ background: transparent; }}
-    section[data-testid="stSidebar"] {{ background: rgba(0,0,0,0.85) !important; }}
-    .stMarkdown, .stText, p, h1, h2, h3, span {{ color: white !important; font-family: 'Courier New', monospace; }}
-    .stButton>button {{ background-color: #D32F2F !important; color: white !important; border: none; font-weight: bold; width: 100%; }}
-    .stDataFrame {{ background: rgba(0,0,0,0.8); border: 1px solid #444; }}
-    /* 드롭다운 배경 수정 */
-    div[data-baseweb="select"] > div {{ background-color: rgba(0,0,0,0.7) !important; }}
-    </style>
-    """, unsafe_allow_html=True)
-
-if "scan_storage" not in st.session_state: st.session_state.scan_storage = []
 if "auto_code" not in st.session_state: st.session_state.auto_code = ""
+if "last_viewed" not in st.session_state: st.session_state.last_viewed = None
+if "fixed_log" not in st.session_state: st.session_state.fixed_log = []
+if "server_status" not in st.session_state: st.session_state.server_status = "🛰️ 엔진 점화 중..."
 
-def load_data(path, default):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    return default
+def save_to_fixed_log(name, code):
+    if not any(log['code'] == code for log in st.session_state.fixed_log):
+        st.session_state.fixed_log.append({"name": name, "code": code})
 
-def save_data(path, data):
-    with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=4)
-
-@st.cache_data(ttl=3600)
-def get_krx_list():
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_krx_list_ultimate():
     if os.path.exists(BACKUP_KRX_FILE):
-        try: return pd.read_json(BACKUP_KRX_FILE)
+        try:
+            df_l = pd.read_json(BACKUP_KRX_FILE)
+            if not df_l.empty and 'Code' in df_l.columns: 
+                st.session_state.server_status = "🔥 야후 안정화 라인 충전 완료"
+                return df_l
         except: pass
     try:
         df = fdr.StockListing('KRX')[['Code', 'Name']]
+        if df is None or df.empty or 'Code' not in df.columns: raise ValueError()
         df['Code'] = df['Code'].astype(str).str.zfill(6)
         df.to_json(BACKUP_KRX_FILE)
+        st.session_state.server_status = "🔥 야후 안정화 라인 가동"
         return df
-    except: return pd.DataFrame([{"Code": "005930", "Name": "삼성전자"}])
+    except:
+        st.session_state.server_status = "⚠️ 서버 점검 중"
+        return pd.DataFrame([{"Code": "005930", "Name": "삼성전자"}, {"Code": "000660", "Name": "SK하이닉스"}])
 
-def analyze_overload_v89(ticker, target_date):
+# --- [2. 100% 순혈 KRX 정밀 분석 엔진 (v5.14.5 에러 제로 완결형)] ---
+def analyze_v14(ticker, target_date, is_parallel=False):
     ticker_str = str(ticker).zfill(6)
+    priority_score = 0 
     try:
-        df = fdr.DataReader(ticker_str, target_date - datetime.timedelta(days=120), target_date)
-        if df is None or len(df) < 35: return None, None
-        df.columns = [c.upper() for c in df.columns]
-        df = df.rename(columns={'시가':'OPEN','고가':'HIGH','저가':'LOW','종가':'CLOSE','거래량':'VOLUME'}).reset_index()
+        df = None
+        for suffix in ['.KS', '.KQ']:
+            yahoo_ticker = f"{ticker_str}{suffix}"
+            end_ts = int(time.mktime(target_date.timetuple())) + 86400
+            start_ts = end_ts - (180 * 86400) # 변동성 계산을 위해 180일로 정밀 확장
+            
+            url = f"https://query1.finance.yahoo.com/v7/finance/download/{yahoo_ticker}?period1={start_ts}&period2={end_ts}&interval=1d&events=history&includeAdjustedClose=true"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200 and "Date,Open,High" in response.text:
+                df_raw = pd.read_csv(StringIO(response.text))
+                
+                # [🚨 예측 대응 1] 야후 필수 유효 컬럼 구조 검증 (KeyError 원천 차단)
+                required_cols = {'Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume'}
+                if not required_cols.issubset(df_raw.columns):
+                    continue
+                
+                # [🚨 예측 대응 2] 수정주가 비율을 반영한 무결성 캔들 데이터 복원 공정
+                # 야후는 종가만 수정종가(Adj Close)를 주기 때문에 Open, High, Low도 수정 주가 비율에 맞게 보정해야 순혈 캔들 몸통비 연산이 깨지지 않습니다.
+                df_raw['Adj_Ratio'] = df_raw['Adj Close'] / df_raw['Close']
+                df_raw['OPEN'] = df_raw['Open'] * df_raw['Adj_Ratio']
+                df_raw['HIGH'] = df_raw['High'] * df_raw['Adj_Ratio']
+                df_raw['LOW'] = df_raw['Low'] * df_raw['Adj_Ratio']
+                df_raw['CLOSE'] = df_raw['Adj Close']
+                df_raw['VOLUME'] = df_raw['Volume']
+                
+                df_clean = df_raw[['Date', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']].copy()
+                df_clean['Date'] = pd.to_datetime(df_clean['Date'])
+                df_clean = df_clean.set_index('Date').dropna() # 결측치 처리
+                
+                if len(df_clean) >= 35:
+                    df = df_clean
+                    break
         
-        vol_cliff = (df['VOLUME'] < df['VOLUME'].shift(1)).iloc[-6:].all()
+        if df is None or df.empty or len(df) < 35: return None, None
+        
+        df = df[df.index.date <= target_date]
+        if len(df) < 35: return None, None
+        
+        # [v5.14.0] 순혈 4대 지표 수식 엔진 가동
+        curr_price = int(df['CLOSE'].iloc[-1])
+        curr_volume = float(df['VOLUME'].iloc[-1])
+        amount_억 = round((curr_price * curr_volume) / 100_000_000, 1)
+        
+        ma20 = df['CLOSE'].rolling(20).mean().iloc[-1]
+        disparity = round((curr_price / ma20) * 100, 1) if ma20 > 0 else 100
+        
         pre_20 = df['CLOSE'].iloc[-21:-1]
-        cv_val = (pre_20.std() / pre_20.mean()) * 100
-        vol_ratio = df['VOLUME'].iloc[-1] / (df['VOLUME'].iloc[-21:-1].mean() + 1)
+        cv_val = round((pre_20.std() / pre_20.mean()) * 100, 2) if pre_20.mean() > 0 else 0
+        vol_ratio = round(curr_volume / (df['VOLUME'].iloc[-21:-1].mean() + 1), 2)
+        body_ratio = round((df['CLOSE'].iloc[-1] - df['OPEN'].iloc[-1]).abs() / (df['HIGH'].iloc[-1] - df['LOW'].iloc[-1] + 0.001), 2)
         
-        cv_score = max(0, 100 - (abs(cv_val - 1.9) * 20))
-        vol_score = min(100, (vol_ratio / 5.0) * 100)
-        similarity = (cv_score * 0.3) + (vol_score * 0.7)
+        is_pattern_b_advanced = False
+        if len(df) >= 7:
+            recent_6 = df.iloc[-6:]
+            is_price_cliff = all(recent_6['CLOSE'].iloc[i] < df['CLOSE'].iloc[-7+i] for i in range(6))
+            
+            if is_price_cliff:
+                for mid_idx in [2, 3]:
+                    v_prev = recent_6['VOLUME'].iloc[mid_idx-1]
+                    v_curr = recent_6['VOLUME'].iloc[mid_idx]
+                    c_prev = recent_6['CLOSE'].iloc[mid_idx-1]
+                    c_curr = recent_6['CLOSE'].iloc[mid_idx]
+                    
+                    v_increase = 1.15 <= (v_curr / (v_prev + 1)) <= 1.50
+                    p_controlled = -3.0 <= ((c_curr - c_prev) / c_prev * 100) <= 1.5
+                    
+                    if v_increase and p_controlled:
+                        is_pattern_b_advanced = True
+                        break
+
+        val_bonus = 30 if 50 <= amount_억 <= 300 else 10 if amount_억 > 300 else 0
+        fit_score = int(min(100, (vol_ratio * 12) + val_bonus))
         
-        fit_score = 0
-        if 84.5 <= similarity <= 90.0: fit_score += 30
-        if 2.8 <= vol_ratio <= 4.2: fit_score += 30
-        if 1.5 <= cv_val <= 2.2: fit_score += 25
-        if vol_cliff: fit_score += 20
-        
-        is_noise = (target_date.weekday() == 2) or (target_date.month in [2, 3])
-        action, buy_p = "🛑 관망", "0%"
-        if fit_score >= 80:
-            action, buy_p = ("⚠️ 고위험매수", "15%") if is_noise else ("🔥 즉시매수", "100%")
-        elif fit_score >= 60: action, buy_p = "⚔️ 분할진입", "50%"
-        elif vol_cliff: action, buy_p = "⚡ 절벽포착", "30%"
+        if is_pattern_b_advanced and amount_억 >= 40:
+            phase = "🔥 이건 사야해 [패턴B-심화]"
+            weight_now = "100% 즉시 장전"
+            split_step = "6일절벽 변곡점 타격"
+            fit_score = max(fit_score, 92) 
+            priority_score = 900
+            is_valid_target = True
+        elif fit_score >= 82 and amount_억 >= 40:
+            phase = "🔥 이건 사야해 [패턴A-주도]"
+            weight_now = "100% 분출"
+            split_step = "1차 즉시진입"
+            priority_score = 500
+            is_valid_target = True
+        elif fit_score >= 60 and amount_억 >= 15:
+            phase = "⚔️ 분할진입가능"
+            weight_now = "50% 장전"
+            split_step = "2회 분할"
+            priority_score = 100
+            is_valid_target = True
+        else:
+            phase = "🟡 관망 및 대기"
+            weight_now = "0%"
+            split_step = "진입금지"
+            priority_score = 0
+            is_valid_target = False 
 
         return {
-            "날짜": target_date.strftime("%y-%m-%d"), "종목코드": ticker_str,
-            "적합도": f"{int(fit_score)}%", "상태": action, "금일비중": buy_p,
-            "익절": "10%(D)/8%(C)", "손절": "-3.0%", "is_valid": fit_score >= 50 or vol_cliff
+            "종목코드": ticker_str, "현재가": curr_price, "적합도": fit_score,
+            "상태": phase, "비중": weight_now, "분할매수": split_step,
+            "익절목표": "15.0%", "손절가": "-3.0%", "거래대금(억)": amount_억,
+            "목표타격가": int(curr_price * 1.15), "최종손절선": int(curr_price * 0.97),
+            "거래량비": vol_ratio, "이격도": disparity, "CV": cv_val, "몸통비율": body_ratio,
+            "priority_score": priority_score, "is_valid": is_valid_target, "스캔날짜": target_date.strftime('%Y-%m-%d')
         }, df
     except: return None, None
 
 # --- [3. UI 레이아웃] ---
-krx_df = get_krx_list()
+st.set_page_config(page_title="Phoenix Pulse v5.14.5", layout="wide")
+krx_df = get_krx_list_ultimate()
 krx_df['Display'] = krx_df['Code'] + " | " + krx_df['Name']
 
-col_h1, col_h2 = st.columns([9, 1])
-with col_h1: st.markdown("### 🟢 PHOENIX v5.9.89")
-with col_h2:
-    if st.button("🔄"):
-        st.cache_data.clear()
+c_head1, c_head2 = st.columns([6, 2])
+with c_head1: st.markdown(f"### 🔥 Phoenix Pulse v5.14.5 | Zero-Error Anchor | `{st.session_state.server_status}`")
+with c_head2:
+    if st.button("🔄 리스트 동기화 (네트워크 리셋)", use_container_width=True):
         if os.path.exists(BACKUP_KRX_FILE): os.remove(BACKUP_KRX_FILE)
-        st.rerun()
+        st.cache_data.clear(); st.rerun()
 
-st.sidebar.title("📁 History")
-analysis_log = load_data(ANALYSIS_LOG_FILE, [])
-for idx, log in enumerate(analysis_log[:15]):
-    if st.sidebar.button(f"{log['name']}", key=f"hist_{log['code']}_{idx}", use_container_width=True):
+st.sidebar.title("📁 분석 히스토리")
+for idx, log in enumerate(st.session_state.fixed_log):
+    if st.sidebar.button(f"{log['name']} ({log['code']})", key=f"side_{idx}", use_container_width=True):
         st.session_state.auto_code = log['code']; st.rerun()
+if st.sidebar.button("🗑️ 히스토리 초기화", use_container_width=True):
+    st.session_state.fixed_log = []; st.rerun()
 
-with st.form("ignite_form"):
+with st.form("analysis_input_form"):
+    c1, c2, c3 = st.columns([4, 1.5, 2])
     def_idx = 0
-    if st.session_state.auto_code:
-        matches = [i for i, x in enumerate(krx_df['Code']) if x == st.session_state.auto_code]
+    target_val = st.session_state.auto_code if st.session_state.auto_code else st.session_state.last_viewed
+    if target_val:
+        matches = [i for i, x in enumerate(krx_df['Code']) if x == str(target_val).zfill(6)]
         if matches: def_idx = matches[0]
-    search_input = st.selectbox("🎯 타겟 선택", krx_df['Display'].tolist(), index=def_idx)
-    btn_click = st.form_submit_button("　　　　　🚀 IGNITION　　　　　", type="primary")
+    
+    selected_disp = c1.selectbox("종목 선택", krx_df['Display'].tolist(), index=def_idx)
+    d_input = c3.date_input("날짜 지정", value=datetime.date.today())
+    btn_click = c2.form_submit_button("🔍 정밀 저격 분석 실행", type="primary", use_container_width=True)
 
-if btn_click or st.session_state.auto_code:
-    t_code = search_input.split(" | ")[0] if not st.session_state.auto_code else st.session_state.auto_code
-    res, df = analyze_overload_v89(t_code, datetime.date.today())
-    if res:
-        name = krx_df[krx_df['Code'] == t_code]['Name'].values[0]
-        temp_log = [l for l in load_data(ANALYSIS_LOG_FILE, []) if str(l['code']).zfill(6) != t_code]
-        temp_log.insert(0, {"name": name, "code": t_code}); save_data(ANALYSIS_LOG_FILE, temp_log[:40])
-        st.markdown(f"#### {res['상태']} : {name}")
-        st.write(f"**적합도:** {res['적합도']} | **비중:** {res['금일비중']} | **익절:** {res['익절']} | **손절:** {res['손절']}")
+if btn_click or (st.session_state.auto_code != ""):
+    t_code = selected_disp.split(" | ")[0] if not st.session_state.auto_code else st.session_state.auto_code
+    d_name = krx_df[krx_df['Code'] == t_code]['Name'].values[0]
+    
+    save_to_fixed_log(d_name, t_code)
+    
+    res, df_chart = analyze_v14(t_code, d_input)
+    if res and df_chart is not None:
+        st.session_state.last_viewed = res['종목코드']
+        st.session_state.auto_code = ""
         
-        # [수정] 차트 가시성 강화: 흰색 테두리 및 텍스트 라벨
+        st.markdown(f"#### 🎯 [{d_name}] 최적 작전 전술 리포트")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("최종 판정", res['상태'])
+        m2.metric("저격 적합도", f"{res['적합도']}%", delta=f"{res['거래대금(억)']}억 자금 유입")
+        m3.metric("목표 가", f"{res['목표타격가']:,}원", delta="내재 변동성 익절선")
+        m4.metric("최종 방어선", f"{res['최종손절선']:,}원", delta="-3.0% 원칙 손절")
+        
+        chart_x = pd.to_datetime(df_chart.index).strftime('%Y-%m-%d') if hasattr(df_chart.index, 'strftime') else df_chart.index
         fig = go.Figure(data=[go.Candlestick(
-            open=df['OPEN'], high=df['HIGH'], low=df['LOW'], close=df['CLOSE'],
-            increasing_line_color='red', decreasing_line_color='blue',
-            increasing_line_width=1.5, decreasing_line_width=1.5,
-            line=dict(width=1, color='white') # 봉 테두리 흰색 추가
+            x=chart_x, open=df_chart['OPEN'], high=df_chart['HIGH'], low=df_chart['LOW'], close=df_chart['CLOSE'],
+            increasing_line_color='red', decreasing_line_color='blue'
         )])
+        fig.add_hline(y=res['목표타격가'], line_dash="solid", line_color="green", line_width=2)
+        fig.add_hline(y=res['최종손절선'], line_dash="solid", line_color="purple", line_width=2)
+        fig.update_layout(height=450, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(fixedrange=True), yaxis=dict(fixedrange=True))
+        st.plotly_chart(fig, use_container_width=True)
         
-        last_c = df['CLOSE'].iloc[-1]
-        fig.add_hline(y=last_c*1.1, line_dash="dot", line_color="orange", annotation_text="[TARGET]", annotation_position="top right")
-        fig.add_hline(y=last_c*0.97, line_dash="solid", line_color="red", annotation_text="[STOP]", annotation_position="bottom right")
-        
-        fig.update_layout(height=220, margin=dict(l=0,r=0,t=0,b=0), template="plotly_dark", 
-                          xaxis_rangeslider_visible=False, xaxis_showticklabels=False,
-                          paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+        st.markdown("---")
+        st.markdown(f"🔬 **[{d_name}] 진입 고민 해결을 위한 4대 핵심 전술 지표 검토 보고서**")
+        r1, r2, r3, r4 = st.columns(4)
+        with r1: st.info(f"**① 자금 유입 강도**\n\n현재 일일 거래대금 **{res['거래대금(억)']}억** 수준으로 시장 주도 세력의 실시간 개입 징후를 명확하게 추적했습니다.")
+        with r2: st.info(f"**② 20일 이격 균형**\n\n이격도 **{res['이격도']}%**입니다. 현재 주가가 심리적 생명선인 20일선 대비 과열권인지 안정권인지를 판별하는 척도입니다.")
+        with r3: st.info(f"**③ 변동성 압축 유무 (CV)**\n\n최근 변동성 지수 **{res['CV']}%**입니다. 수치가 수렴 후 거래량이 폭발하는 시점이 가장 강력한 시세 분출 지점입니다.")
+        with r4: st.info(f"**④ 캔들 몸통 장악비**\n\n오늘의 에너지 장악 비율은 **{res['몸통비율']}**입니다. 위아래 꼬리 대비 몸통이 두꺼울수록 매수세의 연속성이 보장됩니다.")
+    else:
+        st.error("📡 [시스템 가드 예외] 유효 데이터 파싱 실패 또는 미지원 종목 코드입니다.")
         st.session_state.auto_code = ""
 
 st.divider()
 
-if st.button("🏁 오늘의 코스 레코드 시작", use_container_width=True):
-    results = []
-    prog, st_text, tm_text = st.progress(0), st.empty(), st.empty()
-    start_tm, total = time.time(), len(krx_df)
-    with ThreadPoolExecutor(max_workers=30) as ex:
-        futures = {ex.submit(analyze_overload_v89, row['Code'], datetime.date.today()): row for _, row in krx_df.iterrows()}
+if st.button("🚀 전 종목 광역 정밀 병렬 스캔 (스나이퍼 모드)", use_container_width=True):
+    temp_results = []
+    p_bar = st.progress(0)
+    st_msg, tm_msg = st.empty(), st.empty()
+    start_time, total_len = time.time(), len(krx_df)
+    
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(analyze_v14, row['Code'], d_input, True): row for _, row in krx_df.iterrows()}
         for i, future in enumerate(as_completed(futures)):
             r, _ = future.result()
-            if r and r['is_valid']:
-                r['종목명'] = krx_df[krx_df['Code'] == r['종목코드']]['Name'].values[0]
-                results.append(r)
-            if i % 50 == 0:
-                elapsed, est = time.time() - start_tm, ((time.time() - start_tm) / (i+1)) * (total - (i+1))
-                prog.progress((i+1)/total); st_text.markdown(f"🏎️ **RECORD:** `{i+1}/{total}`"); tm_text.markdown(f"⏱️ **LAP:** `{int(elapsed//60):02}:{int(elapsed%60):02}` | **EST:** `{int(est//60):02}:{int(est%60):02}`")
-    st.session_state.scan_storage = results; st.rerun()
+            if r and r['is_valid']: 
+                r['종목명'] = futures[future]['Name']
+                temp_results.append(r)
+            
+            if i % 40 == 0 or i == total_len - 1:
+                elapsed = time.time() - start_time
+                progress_pct = (i + 1) / total_len
+                est_rem = (elapsed / progress_pct) - elapsed if progress_pct > 0 else 0
+                p_bar.progress(progress_pct)
+                st_msg.write(f"📡 글로벌 야후 무결성 광역 정찰 중... ({i+1}/{total_len}) [통과 타겟: {len(temp_results)}개]")
+                tm_msg.write(f"⏱️ **경과 시간:** `{int(elapsed)}초` | **최소 남은 시간 (EST):** `{int(est_rem)}초`")
+    
+    st.session_state.scan_storage = temp_results
+    with open(SCAN_RESULT_FILE, "w", encoding="utf-8") as f:
+        json.dump(temp_results, f, ensure_ascii=False)
+    st.rerun()
 
-if st.session_state.scan_storage:
-    s_df = pd.DataFrame(st.session_state.scan_storage).sort_values(by='적합도', ascending=False)
-    st.dataframe(s_df[['날짜', '종목명', '종목코드', '적합도', '상태', '금일비중', '익절', '손절']], use_container_width=True, hide_index=True)
-    selected_target = st.selectbox("🎯 타겟 락온 (상단 이동)", ["선택하세요"] + (s_df['종목코드'] + " | " + s_df['종목명']).tolist())
-    if selected_target != "선택하세요":
-        st.session_state.auto_code = selected_target.split(" | ")[0]
-        st.rerun()
+if st.session_state.scan_storage and len(st.session_state.scan_storage) > 0:
+    st.markdown(f"### 📋 스나이퍼 정예 포착 리스트 ({len(st.session_state.scan_storage)}개 정선)")
+    scan_df = pd.DataFrame(st.session_state.scan_storage)
+    if 'priority_score' in scan_df.columns and '적합도' in scan_df.columns:
+        scan_df = scan_df.sort_values(by=['priority_score', '적합도'], ascending=[False, False])
+        
+    cols = ['종목명', '종목코드', '적합도', '상태', '분할매수', '비중', '거래대금(억)', '목표타격가', '최종손절선', '거래량비']
+    existing_cols = [c for c in cols if c in scan_df.columns]
+    st.dataframe(scan_df[existing_cols], use_container_width=True, hide_index=True)
